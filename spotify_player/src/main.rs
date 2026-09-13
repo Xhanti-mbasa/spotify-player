@@ -67,7 +67,7 @@ fn init_logging(
     let backtrace_file = std::sync::Mutex::new(backtrace_file);
     std::panic::set_hook(Box::new(move |info| {
         let mut file = backtrace_file.lock().unwrap();
-        let backtrace = backtrace::Backtrace::new();
+        let backtrace = std::backtrace::Backtrace::force_capture();
         writeln!(&mut file, "Got a panic: {info:#?}\n").unwrap();
         writeln!(&mut file, "Stack backtrace:\n{backtrace:?}").unwrap();
     }));
