@@ -233,12 +233,19 @@ pub async fn new_connection(
         .player_event_hook_command
         .as_ref()
         .map(|cmd| {
-            let cmd = cmd.clone();
-            let (sender, receiver) = std::sync::mpsc::channel::<PlayerEvent>();
-            tokio::task::spawn_blocking(move || {
-                while let Ok(event) = receiver.recv() {
-                    if let Err(err) = execute_player_event_hook_command(&cmd, &event) {
-                        tracing::warn!("Failed to execute player event hook command: {err:#}");
+            let cmd = Arc::new(cmd.clone());
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<PlayerEvent>();
+            tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    let cmd = Arc::clone(&cmd);
+                    match tokio::task::spawn_blocking(move || {
+                        execute_player_event_hook_command(&cmd, &event)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => tracing::warn!("Player event hook failed: {err:#}"),
+                        Err(err) => tracing::warn!("Player event hook task failed: {err:#}"),
                     }
                 }
             });

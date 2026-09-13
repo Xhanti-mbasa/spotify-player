@@ -28,8 +28,6 @@ async fn client(server: &MockServer) -> AppClient {
         api_client: WebApiClient::new(api, None),
         #[cfg(feature = "streaming")]
         stream_conn: Arc::new(Mutex::new(None)),
-        #[cfg(feature = "streaming")]
-        user_requested_playback: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
 

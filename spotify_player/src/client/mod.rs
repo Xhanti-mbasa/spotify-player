@@ -75,8 +75,9 @@ struct PlaybackSync {
     control: tokio::sync::Mutex<()>,
     command_at: parking_lot::Mutex<Option<std::time::Instant>>,
     poll: tokio::sync::Mutex<()>,
-    poll_at: parking_lot::Mutex<Option<std::time::Instant>>,
     refresh: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "streaming")]
+    user_requested: std::sync::atomic::AtomicBool,
 }
 
 /// The application's Spotify client
@@ -84,8 +85,6 @@ struct PlaybackSync {
 pub struct AppClient {
     http: reqwest::Client,
     playback_sync: Arc<PlaybackSync>,
-    #[cfg(feature = "streaming")]
-    user_requested_playback: Arc<std::sync::atomic::AtomicBool>,
     /// The integrated Spotify client, mainly used for streaming and librespot integration
     spotify: Arc<spotify::Spotify>,
     auth_config: AuthConfig,
@@ -191,8 +190,6 @@ impl AppClient {
             spotify: Arc::new(spotify::Spotify::new()),
             http: reqwest::Client::new(),
             playback_sync: Arc::new(PlaybackSync::default()),
-            #[cfg(feature = "streaming")]
-            user_requested_playback: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auth_config,
             api_client,
 
@@ -368,7 +365,8 @@ impl AppClient {
     #[cfg(feature = "streaming")]
     pub fn pause_streaming_on_startup(&self) -> bool {
         if self
-            .user_requested_playback
+            .playback_sync
+            .user_requested
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             return true;
@@ -432,7 +430,8 @@ impl AppClient {
                 | PlayerRequest::ResumePause
                 | PlayerRequest::TransferPlayback(_, true)
         ) {
-            self.user_requested_playback
+            self.playback_sync
+                .user_requested
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let needs_device = matches!(
@@ -1866,13 +1865,6 @@ impl AppClient {
         };
         let previous_command = *self.playback_sync.command_at.lock();
         drop(control);
-        {
-            let mut timer = self.playback_sync.poll_at.lock();
-            if timer.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(750)) {
-                return Ok(());
-            }
-            *timer = Some(std::time::Instant::now());
-        }
         let new_playback = {
             // update the playback state
             let mut playback = self.current_playback2().await?;
