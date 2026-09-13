@@ -70,16 +70,20 @@ fn parse_current_playback_response(
     Ok(Some(serde_json::from_value(response)?))
 }
 
+#[derive(Default)]
+struct PlaybackSync {
+    control: tokio::sync::Mutex<()>,
+    command_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    poll: tokio::sync::Mutex<()>,
+    poll_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    refresh: std::sync::atomic::AtomicBool,
+}
+
 /// The application's Spotify client
 #[derive(Clone)]
 pub struct AppClient {
     http: reqwest::Client,
-    // Serialize state snapshots with commands; never hold a player-state lock over I/O.
-    playback_control: Arc<tokio::sync::Mutex<()>>,
-    last_player_command: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
-    playback_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
-    playback_poll: Arc<tokio::sync::Mutex<()>>,
-    playback_refresh_timer: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    playback_sync: Arc<PlaybackSync>,
     #[cfg(feature = "streaming")]
     user_requested_playback: Arc<std::sync::atomic::AtomicBool>,
     /// The integrated Spotify client, mainly used for streaming and librespot integration
@@ -186,11 +190,7 @@ impl AppClient {
         Ok(Self {
             spotify: Arc::new(spotify::Spotify::new()),
             http: reqwest::Client::new(),
-            playback_control: Arc::new(tokio::sync::Mutex::new(())),
-            last_player_command: Arc::new(parking_lot::Mutex::new(None)),
-            playback_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            playback_poll: Arc::new(tokio::sync::Mutex::new(())),
-            playback_refresh_timer: Arc::new(parking_lot::Mutex::new(None)),
+            playback_sync: Arc::new(PlaybackSync::default()),
             #[cfg(feature = "streaming")]
             user_requested_playback: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auth_config,
@@ -223,8 +223,8 @@ impl AppClient {
                         return;
                     }
 
-                    let _control = client.playback_control.lock().await;
-                    if client.last_player_command.lock().is_some() {
+                    let _control = client.playback_sync.control.lock().await;
+                    if client.playback_sync.command_at.lock().is_some() {
                         break;
                     }
                     // if playback exists, don't connect to a new device
@@ -414,7 +414,7 @@ impl AppClient {
             playback.is_playing = is_playing;
         }
         player.playback_last_updated_time = Some(std::time::Instant::now());
-        *self.last_player_command.lock() = Some(std::time::Instant::now());
+        *self.playback_sync.command_at.lock() = Some(std::time::Instant::now());
     }
 
     /// Handle a player request, return a new playback metadata on success
@@ -847,12 +847,14 @@ impl AppClient {
     }
 
     pub(crate) fn request_playback_refresh(&self) {
-        self.playback_refresh_requested
+        self.playback_sync
+            .refresh
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(super) fn take_playback_refresh_request(&self) -> bool {
-        self.playback_refresh_requested
+        self.playback_sync
+            .refresh
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -908,7 +910,7 @@ impl AppClient {
         state: &SharedState,
         request: PlayerRequest,
     ) -> Result<()> {
-        let _control = self.playback_control.lock().await;
+        let _control = self.playback_sync.control.lock().await;
         if matches!(
             &request,
             PlayerRequest::ToggleMute | PlayerRequest::TransferPlayback(..)
@@ -918,7 +920,8 @@ impl AppClient {
         // Refresh an old snapshot before a toggle/device-dependent command. Explicit play and
         // pause always send their requested action, even if Spotify's cached state disagrees.
         let recent_command = self
-            .last_player_command
+            .playback_sync
+            .command_at
             .lock()
             .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1));
         let stale = {
@@ -951,7 +954,7 @@ impl AppClient {
             }
             player.buffered_playback.clone_from(playback);
             player.reconcile_pending_volume();
-            *self.last_player_command.lock() = Some(std::time::Instant::now());
+            *self.playback_sync.command_at.lock() = Some(std::time::Instant::now());
         } else {
             state.player.write().pending_volume = None;
         }
@@ -1855,16 +1858,16 @@ impl AppClient {
         state: &SharedState,
         reset_buffered_playback: bool,
     ) -> Result<()> {
-        let Ok(poll) = self.playback_poll.try_lock() else {
+        let Ok(poll) = self.playback_sync.poll.try_lock() else {
             return Ok(());
         };
-        let Ok(control) = self.playback_control.try_lock() else {
+        let Ok(control) = self.playback_sync.control.try_lock() else {
             return Ok(());
         };
-        let previous_command = *self.last_player_command.lock();
+        let previous_command = *self.playback_sync.command_at.lock();
         drop(control);
         {
-            let mut timer = self.playback_refresh_timer.lock();
+            let mut timer = self.playback_sync.poll_at.lock();
             if timer.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(750)) {
                 return Ok(());
             }
@@ -1873,11 +1876,11 @@ impl AppClient {
         let new_playback = {
             // update the playback state
             let mut playback = self.current_playback2().await?;
-            let Ok(_control) = self.playback_control.try_lock() else {
+            let Ok(_control) = self.playback_sync.control.try_lock() else {
                 return Ok(());
             };
             let mut player = state.player.write();
-            if previous_command != *self.last_player_command.lock() {
+            if previous_command != *self.playback_sync.command_at.lock() {
                 return Ok(());
             }
 
