@@ -135,35 +135,15 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         }
     });
 
-    // client event handler task
+    // One runtime owns request ordering, refreshes, and session recovery.
     tokio::task::spawn({
         let state = state.clone();
         let client = client.clone();
+        let client_pub = client_pub.clone();
         async move {
-            client::start_client_handler(&state, &client, &client_sub).await;
+            client::run(&state, &client, &client_pub, &client_sub).await;
         }
     });
-
-    // background task that detects an invalidated session and reconnects,
-    // independent of any incoming client request
-    tokio::task::spawn({
-        let state = state.clone();
-        let client = client.clone();
-        async move {
-            client::start_session_watcher(state, client).await;
-        }
-    });
-
-    // player event watcher task
-    std::thread::Builder::new()
-        .name("player-event-watcher".to_string())
-        .spawn({
-            let state = state.clone();
-            let client_pub = client_pub.clone();
-            move || {
-                client::start_player_event_watcher(&state, &client_pub);
-            }
-        })?;
 
     if !state.is_daemon {
         #[cfg(feature = "image")]

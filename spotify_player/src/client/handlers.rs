@@ -20,84 +20,11 @@ struct PlayerEventHandlerState {
     last_queue_refresh: Option<(String, Instant)>,
 }
 
-/// starts the client's request handler
-pub async fn start_client_handler(
-    state: &SharedState,
-    client: &super::AppClient,
-    client_sub: &flume::Receiver<ClientRequest>,
-) {
-    let (player_pub, player_sub) = flume::unbounded();
-    let player_client = client.clone();
-    let player_state = state.clone();
-    tokio::spawn(async move {
-        let mut deferred = None;
-        loop {
-            let request = if let Some(request) = deferred.take() {
-                request
-            } else if let Ok(request) = player_sub.recv_async().await {
-                request
-            } else {
-                break;
-            };
-            let mut request = request;
-            if matches!(&request, super::PlayerRequest::Volume(_)) {
-                while let Ok(next) = player_sub.try_recv() {
-                    if matches!(&next, super::PlayerRequest::Volume(_)) {
-                        request = next;
-                    } else {
-                        deferred = Some(next);
-                        break;
-                    }
-                }
-            }
-            if let Err(err) = player_client
-                .handle_state_player_request(&player_state, request)
-                .await
-            {
-                tracing::error!("Failed to handle player request: {err:#}");
-            }
-        }
-    });
-    while let Ok(request) = client_sub.recv_async().await {
-        if let ClientRequest::Player(request) = request {
-            if let Err(err) = player_pub.send(request) {
-                tracing::error!("Playback command queue disconnected: {err:#}");
-            }
-            continue;
-        }
-        let state = state.clone();
-        let client = client.clone();
-        let span = tracing::info_span!("client_request", request = ?request);
-
-        tokio::task::spawn(
-            async move {
-                if let Err(err) = client.handle_request(&state, request).await {
-                    tracing::error!("Failed to handle client request: {err:#}");
-                }
-            }
-            .instrument(span),
-        );
-    }
-}
-
 /// Interval between background session-validity checks.
 const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const EVENT_INTERVAL: Duration = Duration::from_millis(100);
 const CONTEXT_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
 const QUEUE_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
-
-pub async fn start_session_watcher(state: SharedState, client: super::AppClient) {
-    let mut interval = tokio::time::interval(SESSION_CHECK_INTERVAL);
-    // If a check ever runs long (e.g. a slow reconnect), skip missed ticks
-    // rather than firing them back-to-back.
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        interval.tick().await;
-        if let Err(err) = client.check_valid_session(&state).await {
-            tracing::error!("Failed to check/reconnect the client's session: {err:#}");
-        }
-    }
-}
 
 fn handle_playback_change_event(
     state: &SharedState,
@@ -255,11 +182,14 @@ fn handle_player_event(
     Ok(())
 }
 
-/// Starts event watcher listening to events and making update requests to the client if needed
-pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sender<ClientRequest>) {
+/// Runs request dispatch, playback refreshes, and session recovery from one event loop.
+pub async fn run(
+    state: &SharedState,
+    client: &super::AppClient,
+    client_pub: &flume::Sender<ClientRequest>,
+    client_sub: &flume::Receiver<ClientRequest>,
+) {
     let configs = config::get_config();
-
-    let refresh_duration = Duration::from_millis(100);
     let playback_refresh_duration =
         Duration::from_millis(configs.app_config.playback_refresh_duration_in_ms.max(1000));
     let mut handler_state = PlayerEventHandlerState {
@@ -268,23 +198,75 @@ pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sende
         ended_playable_uri: None,
         last_queue_refresh: None,
     };
+    let mut events = tokio::time::interval(EVENT_INTERVAL);
+    let mut sessions = tokio::time::interval(SESSION_CHECK_INTERVAL);
+    events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    sessions.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut deferred = None;
 
     loop {
-        // periodically refresh the playback state (if enabled in config)
-        if configs.app_config.playback_refresh_duration_in_ms > 0
-            && handler_state.last_playback_refresh.elapsed() >= playback_refresh_duration
-        {
-            if let Err(err) = client_pub.send(ClientRequest::GetCurrentPlayback) {
-                tracing::error!("Playback refresh channel disconnected: {err:#}");
-                return;
+        let request = if deferred.is_some() {
+            deferred.take()
+        } else {
+            tokio::select! {
+                request = client_sub.recv_async() => request.ok(),
+                _ = sessions.tick() => {
+                    if let Err(err) = client.check_valid_session(state).await {
+                        tracing::error!("Failed to check/reconnect the client's session: {err:#}");
+                    }
+                    continue;
+                }
+                _ = events.tick() => {
+                    if configs.app_config.playback_refresh_duration_in_ms > 0
+                        && handler_state.last_playback_refresh.elapsed() >= playback_refresh_duration
+                    {
+                        if client_pub.send(ClientRequest::GetCurrentPlayback).is_err() {
+                            return;
+                        }
+                        handler_state.last_playback_refresh = Instant::now();
+                    }
+                    if let Err(err) = handle_player_event(state, client_pub, &mut handler_state) {
+                        tracing::error!("Failed to handle player event: {err:#}");
+                    }
+                    continue;
+                }
             }
-            handler_state.last_playback_refresh = Instant::now();
-        }
+        };
 
-        if let Err(err) = handle_player_event(state, client_pub, &mut handler_state) {
-            tracing::error!("Encounter error when handling player event: {err:#}");
-        }
+        let Some(request) = request else { return };
+        let request = match request {
+            ClientRequest::Player(mut request) => {
+                if matches!(&request, super::PlayerRequest::Volume(_)) {
+                    while let Ok(next) = client_sub.try_recv() {
+                        match next {
+                            ClientRequest::Player(
+                                next @ super::PlayerRequest::Volume(_),
+                            ) => request = next,
+                            next => {
+                                deferred = Some(next);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Err(err) = client.handle_state_player_request(state, request).await {
+                    tracing::error!("Failed to handle player request: {err:#}");
+                }
+                continue;
+            }
+            request => request,
+        };
 
-        std::thread::sleep(refresh_duration);
+        let state = state.clone();
+        let client = client.clone();
+        let span = tracing::info_span!("client_request", request = ?request);
+        tokio::spawn(
+            async move {
+                if let Err(err) = client.handle_request(&state, request).await {
+                    tracing::error!("Failed to handle client request: {err:#}");
+                }
+            }
+            .instrument(span),
+        );
     }
 }
