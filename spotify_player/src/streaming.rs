@@ -234,7 +234,7 @@ pub async fn new_connection(
         .as_ref()
         .map(|cmd| {
             let cmd = cmd.clone();
-            let (sender, receiver) = flume::unbounded::<PlayerEvent>();
+            let (sender, receiver) = std::sync::mpsc::channel::<PlayerEvent>();
             tokio::task::spawn_blocking(move || {
                 while let Ok(event) = receiver.recv() {
                     if let Err(err) = execute_player_event_hook_command(&cmd, &event) {

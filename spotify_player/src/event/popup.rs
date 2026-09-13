@@ -6,7 +6,7 @@ use anyhow::Context;
 
 pub fn handle_key_sequence_for_popup(
     key_sequence: &KeySequence,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -319,7 +319,7 @@ pub fn handle_key_sequence_for_popup(
 
 fn handle_key_sequence_for_create_playlist_popup(
     key_sequence: &KeySequence,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
     let Some(PopupState::PlaylistCreate {
@@ -365,7 +365,7 @@ fn handle_key_sequence_for_create_playlist_popup(
 
 fn handle_key_sequence_for_search_popup(
     key_sequence: &KeySequence,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -499,7 +499,7 @@ fn handle_command_for_list_popup(
 fn handle_key_sequence_for_action_list_popup(
     n_actions: usize,
     key_sequence: &KeySequence,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -538,7 +538,7 @@ fn handle_key_sequence_for_action_list_popup(
 /// Handle the `n`-th action in an action list popup
 pub fn handle_item_action(
     n: usize,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -621,7 +621,7 @@ fn handle_key_sequence_for_playlist_search_popup(
 
 fn handle_key_sequence_for_confirm_popup(
     key_sequence: &KeySequence,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     action: ConfirmableAction,
 ) -> Result<bool> {

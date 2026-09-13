@@ -78,7 +78,7 @@ fn init_logging(
 #[tokio::main]
 async fn start_app(state: &state::SharedState) -> Result<()> {
     // client channels
-    let (client_pub, client_sub) = flume::unbounded::<client::ClientRequest>();
+    let (client_pub, client_sub) = tokio::sync::mpsc::unbounded_channel();
 
     #[cfg(feature = "pulseaudio-backend")]
     {
@@ -141,7 +141,7 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         let client = client.clone();
         let client_pub = client_pub.clone();
         async move {
-            client::run(&state, &client, &client_pub, &client_sub).await;
+            client::run(&state, &client, &client_pub, client_sub).await;
         }
     });
 

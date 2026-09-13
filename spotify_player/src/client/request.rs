@@ -60,3 +60,5 @@ pub enum ClientRequest {
         desc: String,
     },
 }
+
+pub type RequestSender = tokio::sync::mpsc::UnboundedSender<ClientRequest>;

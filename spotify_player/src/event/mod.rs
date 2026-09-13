@@ -34,7 +34,7 @@ mod popup;
 mod window;
 
 /// Start a terminal event handler (key pressed, mouse clicked, etc)
-pub fn start_event_handler(state: &SharedState, client_pub: &flume::Sender<ClientRequest>) {
+pub fn start_event_handler(state: &SharedState, client_pub: &crate::client::RequestSender) {
     while let Ok(event) = crossterm::event::read() {
         let _enter = tracing::info_span!("terminal_event", event = ?event).entered();
         if let Err(err) = match event {
@@ -63,7 +63,7 @@ pub fn start_event_handler(state: &SharedState, client_pub: &flume::Sender<Clien
 
 fn send_volume_change(
     state: &SharedState,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     offset: i32,
 ) -> Result<()> {
     let volume = state.player.write().change_volume(offset);
@@ -76,7 +76,7 @@ fn send_volume_change(
 // Handle a terminal mouse event
 fn handle_mouse_event(
     event: crossterm::event::MouseEvent,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
 ) -> Result<()> {
     tracing::debug!("Handling mouse event: {event:?}");
@@ -128,7 +128,7 @@ fn handle_mouse_event(
 // Handle a terminal key pressed event
 fn handle_key_event(
     event: crossterm::event::KeyEvent,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
 ) -> Result<()> {
     let key: Key = event.into();
@@ -206,7 +206,7 @@ fn handle_key_event(
 pub fn handle_action_in_context(
     action: Action,
     context: ActionContext,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -483,7 +483,7 @@ fn handle_go_to_radio(
     seed_uri: &str,
     seed_name: &str,
     ui: &mut UIStateGuard,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
 ) -> anyhow::Result<()> {
     let radio_id = TracksId::new(format!("radio:{seed_uri}"), format!("{seed_name} Radio"));
     ui.new_page(PageState::Context {
@@ -537,7 +537,7 @@ fn handle_show_actions_on_artist(
 fn handle_global_action(
     action: Action,
     target: ActionTarget,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -580,7 +580,7 @@ fn handle_global_action(
 /// Handle a global command that is not specific to any page/popup
 fn handle_global_command(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
     count: Option<usize>,

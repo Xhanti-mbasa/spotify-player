@@ -77,7 +77,7 @@ fn update_control_metadata(
 /// Start the application's media control event watcher
 pub fn start_event_watcher(
     state: &SharedState,
-    client_pub: flume::Sender<ClientRequest>,
+    client_pub: crate::client::RequestSender,
 ) -> Result<(), souvlaki::Error> {
     tracing::info!("Initializing application's media control event watcher...");
 

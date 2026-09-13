@@ -29,7 +29,7 @@ const QUEUE_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
 
 fn handle_playback_change_event(
     state: &SharedState,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     handler_state: &mut PlayerEventHandlerState,
 ) -> anyhow::Result<()> {
     let player = state.player.read();
@@ -88,7 +88,7 @@ fn handle_playback_change_event(
 
 fn handle_page_change_event(
     state: &SharedState,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     handler_state: &mut PlayerEventHandlerState,
 ) -> anyhow::Result<()> {
     match state.ui.lock().current_page_mut() {
@@ -172,7 +172,7 @@ fn handle_page_change_event(
 
 fn handle_player_event(
     state: &SharedState,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     handler_state: &mut PlayerEventHandlerState,
 ) -> anyhow::Result<()> {
     handle_page_change_event(state, client_pub, handler_state)
@@ -187,8 +187,8 @@ fn handle_player_event(
 pub async fn run(
     state: &SharedState,
     client: &super::AppClient,
-    client_pub: &flume::Sender<ClientRequest>,
-    client_sub: &flume::Receiver<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
+    mut client_sub: tokio::sync::mpsc::UnboundedReceiver<ClientRequest>,
 ) {
     let configs = config::get_config();
     let playback_refresh_duration =
@@ -211,7 +211,7 @@ pub async fn run(
             deferred.take()
         } else {
             tokio::select! {
-                request = client_sub.recv_async() => request.ok(),
+                request = client_sub.recv() => request,
                 _ = sessions.tick() => {
                     if let Err(err) = client.check_valid_session(state).await {
                         tracing::error!("Failed to check/reconnect the client's session: {err:#}");
