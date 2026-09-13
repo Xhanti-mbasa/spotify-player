@@ -239,9 +239,9 @@ pub async fn run(
                 if matches!(&request, super::PlayerRequest::Volume(_)) {
                     while let Ok(next) = client_sub.try_recv() {
                         match next {
-                            ClientRequest::Player(
-                                next @ super::PlayerRequest::Volume(_),
-                            ) => request = next,
+                            ClientRequest::Player(next @ super::PlayerRequest::Volume(_)) => {
+                                request = next
+                            }
                             next => {
                                 deferred = Some(next);
                                 break;
