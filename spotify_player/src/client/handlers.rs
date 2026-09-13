@@ -26,7 +26,45 @@ pub async fn start_client_handler(
     client: &super::AppClient,
     client_sub: &flume::Receiver<ClientRequest>,
 ) {
+    let (player_pub, player_sub) = flume::unbounded();
+    let player_client = client.clone();
+    let player_state = state.clone();
+    tokio::spawn(async move {
+        let mut deferred = None;
+        loop {
+            let request = if let Some(request) = deferred.take() {
+                request
+            } else if let Ok(request) = player_sub.recv_async().await {
+                request
+            } else {
+                break;
+            };
+            let mut request = request;
+            if matches!(&request, super::PlayerRequest::Volume(_)) {
+                while let Ok(next) = player_sub.try_recv() {
+                    if matches!(&next, super::PlayerRequest::Volume(_)) {
+                        request = next;
+                    } else {
+                        deferred = Some(next);
+                        break;
+                    }
+                }
+            }
+            if let Err(err) = player_client
+                .handle_state_player_request(&player_state, request)
+                .await
+            {
+                tracing::error!("Failed to handle player request: {err:#}");
+            }
+        }
+    });
     while let Ok(request) = client_sub.recv_async().await {
+        if let ClientRequest::Player(request) = request {
+            if let Err(err) = player_pub.send(request) {
+                tracing::error!("Playback command queue disconnected: {err:#}");
+            }
+            continue;
+        }
         let state = state.clone();
         let client = client.clone();
         let span = tracing::info_span!("client_request", request = ?request);
@@ -223,7 +261,7 @@ pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sende
 
     let refresh_duration = Duration::from_millis(100);
     let playback_refresh_duration =
-        Duration::from_millis(configs.app_config.playback_refresh_duration_in_ms);
+        Duration::from_millis(configs.app_config.playback_refresh_duration_in_ms.max(1000));
     let mut handler_state = PlayerEventHandlerState {
         last_get_context: Instant::now(),
         last_playback_refresh: Instant::now(),
@@ -236,9 +274,10 @@ pub fn start_player_event_watcher(state: &SharedState, client_pub: &flume::Sende
         if configs.app_config.playback_refresh_duration_in_ms > 0
             && handler_state.last_playback_refresh.elapsed() >= playback_refresh_duration
         {
-            client_pub
-                .send(ClientRequest::GetCurrentPlayback)
-                .unwrap_or_default();
+            if let Err(err) = client_pub.send(ClientRequest::GetCurrentPlayback) {
+                tracing::error!("Playback refresh channel disconnected: {err:#}");
+                return;
+            }
             handler_state.last_playback_refresh = Instant::now();
         }
 

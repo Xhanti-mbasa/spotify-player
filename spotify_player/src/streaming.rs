@@ -228,8 +228,25 @@ pub async fn new_connection(
     let pause_on_startup =
         configs.app_config.pause_on_startup && IS_FIRST_CONNECTION.swap(false, Ordering::SeqCst);
 
+    let hook_pub = configs
+        .app_config
+        .player_event_hook_command
+        .as_ref()
+        .map(|cmd| {
+            let cmd = cmd.clone();
+            let (sender, receiver) = flume::unbounded::<PlayerEvent>();
+            tokio::task::spawn_blocking(move || {
+                while let Ok(event) = receiver.recv() {
+                    if let Err(err) = execute_player_event_hook_command(&cmd, &event) {
+                        tracing::warn!("Failed to execute player event hook command: {err:#}");
+                    }
+                }
+            });
+            sender
+        });
     let player_event_task = tokio::task::spawn({
         let mut channel = player.get_player_event_channel();
+        let device_id = session.device_id().to_owned();
         async move {
             let mut pause_armed = pause_on_startup;
             while let Some(event) = channel.recv().await {
@@ -268,35 +285,40 @@ pub async fn new_connection(
                     }
                     Ok(Some(event)) => {
                         tracing::info!("Got a new player event: {event:?}");
-                        match event {
-                            PlayerEvent::Playing { .. } => {
-                                let mut player = state.player.write();
-                                if let Some(playback) = player.buffered_playback.as_mut() {
-                                    playback.is_playing = true;
-                                }
+                        match &event {
+                            PlayerEvent::Playing {
+                                playable_id,
+                                position_ms,
+                            }
+                            | PlayerEvent::Paused {
+                                playable_id,
+                                position_ms,
+                            } => {
+                                let is_playing = matches!(&event, PlayerEvent::Playing { .. });
+                                client.record_local_playback_event(
+                                    &state,
+                                    &device_id,
+                                    playable_id,
+                                    *position_ms,
+                                    is_playing,
+                                );
                                 if let Some(ref bands) = state.vis_bands {
-                                    bands.lock().is_active = true;
+                                    bands.lock().is_active = is_playing;
                                 }
                             }
-                            PlayerEvent::Paused { .. } => {
-                                let mut player = state.player.write();
-                                if let Some(playback) = player.buffered_playback.as_mut() {
-                                    playback.is_playing = false;
-                                }
+                            PlayerEvent::EndOfTrack { .. } => {
                                 if let Some(ref bands) = state.vis_bands {
                                     bands.lock().is_active = false;
                                 }
                             }
-                            _ => {}
+                            PlayerEvent::Changed { .. } => {}
                         }
                         client.update_playback_non_blocking(&state);
 
-                        // execute a player event hook command
-                        if let Some(ref cmd) = configs.app_config.player_event_hook_command {
-                            if let Err(err) = execute_player_event_hook_command(cmd, &event) {
-                                tracing::warn!(
-                                    "Failed to execute player event hook command: {err:#}"
-                                );
+                        // Preserve hook order without blocking the playback event receiver.
+                        if let Some(sender) = &hook_pub {
+                            if let Err(err) = sender.send(event) {
+                                tracing::warn!("Player event hook queue disconnected: {err:#}");
                             }
                         }
                     }
@@ -308,14 +330,27 @@ pub async fn new_connection(
 
     tracing::info!("Starting an integrated Spotify player using librespot's spirc protocol");
 
-    let (spirc, spirc_task) = Spirc::new(connect_config, session, creds, player, mixer)
-        .await
-        .context("initialize spirc")?;
+    let (spirc, spirc_task) = match Spirc::new(connect_config, session, creds, player, mixer).await
+    {
+        Ok(connection) => connection,
+        Err(err) => {
+            player_event_task.abort();
+            return Err(err).context("initialize spirc");
+        }
+    };
 
     tokio::task::spawn(async move {
+        let mut player_event_task = player_event_task;
         tokio::select! {
-            () = spirc_task => {},
-            _ = player_event_task => {}
+            () = spirc_task => {
+                player_event_task.abort();
+                tracing::debug!("Integrated Spotify connection stopped");
+            },
+            result = &mut player_event_task => {
+                if let Err(err) = result {
+                    tracing::error!("Integrated player event task failed: {err:#}");
+                }
+            }
         }
     });
 

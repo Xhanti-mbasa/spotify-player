@@ -540,3 +540,7 @@ Set the `RUST_LOG` environment variable to control [logging level](https://docs.
 ## Acknowledgement
 
 `spotify_player` is written in [Rust](https://www.rust-lang.org) and built on top of libraries like [ratatui](https://github.com/ratatui/ratatui), [rspotify](https://github.com/ramsayleung/rspotify), [librespot](https://github.com/librespot-org/librespot), and more. It is inspired by [spotify-tui](https://github.com/Rigellute/spotify-tui) and [ncspot](https://github.com/hrkfdn/ncspot).
+
+### Playback reliability patch
+
+Playback commands are ordered, explicit play/pause commands are always sent, and missing playback devices are discovered before starting a track. Volume keys update the display immediately and stay between 0 and 100. Remote playback is polled every second by default; existing configurations with `playback_refresh_duration_in_ms = 0` must change that value to enable polling. Spotify latency and rate limits can delay updates. See [the patch report](docs/playback-reliability.md) for verification, local installation, and rollback.

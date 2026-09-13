@@ -27,6 +27,9 @@ use parking_lot::Mutex;
 use rspotify::model::LibraryId;
 use rspotify::{http::Query, prelude::*};
 
+#[cfg(test)]
+mod playback_tests;
+
 mod handlers;
 mod middleware;
 mod request;
@@ -71,6 +74,15 @@ fn parse_current_playback_response(
 #[derive(Clone)]
 pub struct AppClient {
     http: reqwest::Client,
+    // Serialize state snapshots with commands; never hold a player-state lock over I/O.
+    playback_control: Arc<tokio::sync::Mutex<()>>,
+    last_player_command: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    playback_refresh: Arc<tokio::sync::Mutex<()>>,
+    playback_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
+    playback_poll: Arc<tokio::sync::Mutex<()>>,
+    playback_refresh_timer: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
+    #[cfg(feature = "streaming")]
+    user_requested_playback: Arc<std::sync::atomic::AtomicBool>,
     /// The integrated Spotify client, mainly used for streaming and librespot integration
     spotify: Arc<spotify::Spotify>,
     auth_config: AuthConfig,
@@ -175,6 +187,14 @@ impl AppClient {
         Ok(Self {
             spotify: Arc::new(spotify::Spotify::new()),
             http: reqwest::Client::new(),
+            playback_control: Arc::new(tokio::sync::Mutex::new(())),
+            last_player_command: Arc::new(parking_lot::Mutex::new(None)),
+            playback_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            playback_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            playback_poll: Arc::new(tokio::sync::Mutex::new(())),
+            playback_refresh_timer: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "streaming")]
+            user_requested_playback: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             auth_config,
             api_client,
 
@@ -205,6 +225,10 @@ impl AppClient {
                         return;
                     }
 
+                    let _control = client.playback_control.lock().await;
+                    if client.last_player_command.lock().is_some() {
+                        break;
+                    }
                     // if playback exists, don't connect to a new device
                     if state.player.read().playback.is_some() {
                         tracing::info!("Playback already exists, skipping device connection.");
@@ -326,16 +350,15 @@ impl AppClient {
         session: librespot_core::Session,
         creds: librespot_core::authentication::Credentials,
     ) -> Result<()> {
-        let new_conn =
-            crate::streaming::new_connection(self.clone(), state, session, creds).await?;
-        let mut stream_conn = self.stream_conn.lock();
-        // shutdown old streaming connection and replace it with a new connection
-        if let Some(conn) = stream_conn.as_ref() {
+        // The old device must stop before the replacement registers with Spotify.
+        if let Some(conn) = self.stream_conn.lock().take() {
             if let Err(err) = conn.shutdown() {
-                log::error!("Failed to shutdown old streaming connection: {err:#}");
+                tracing::error!("Failed to shutdown old streaming connection: {err:#}");
             }
         }
-        *stream_conn = Some(new_conn);
+        let new_conn =
+            crate::streaming::new_connection(self.clone(), state, session, creds).await?;
+        *self.stream_conn.lock() = Some(new_conn);
         Ok(())
     }
 
@@ -346,15 +369,54 @@ impl AppClient {
     /// previous session on startup when `pause_on_startup` is enabled.
     #[cfg(feature = "streaming")]
     pub fn pause_streaming_on_startup(&self) -> bool {
+        if self
+            .user_requested_playback
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return true;
+        }
         match self.stream_conn.lock().as_ref() {
             Some(spirc) => {
                 if let Err(err) = spirc.pause() {
                     tracing::warn!("Failed to pause integrated client on startup: {err:#}");
+                    return false;
                 }
                 true
             }
             None => false,
         }
+    }
+
+    #[cfg(feature = "streaming")]
+    pub(crate) fn record_local_playback_event(
+        &self,
+        state: &SharedState,
+        device_id: &str,
+        playable_id: &rspotify::model::PlayableId<'_>,
+        position_ms: u32,
+        is_playing: bool,
+    ) {
+        let mut player = state.player.write();
+        let matches = player.playback.as_ref().is_some_and(|p| {
+            p.device.id.as_deref() == Some(device_id)
+                && p.item
+                    .as_ref()
+                    .and_then(rspotify::model::PlayableItem::id)
+                    .as_ref()
+                    == Some(playable_id)
+        });
+        if !matches {
+            return;
+        }
+        if let Some(playback) = player.playback.as_mut() {
+            playback.progress = Some(chrono::Duration::milliseconds(i64::from(position_ms)));
+            playback.is_playing = is_playing;
+        }
+        if let Some(playback) = player.buffered_playback.as_mut() {
+            playback.is_playing = is_playing;
+        }
+        player.playback_last_updated_time = Some(std::time::Instant::now());
+        *self.last_player_command.lock() = Some(std::time::Instant::now());
     }
 
     /// Handle a player request, return a new playback metadata on success
@@ -363,6 +425,39 @@ impl AppClient {
         request: PlayerRequest,
         mut playback: Option<PlaybackMetadata>,
     ) -> Result<Option<PlaybackMetadata>> {
+        tracing::debug!(?request, ?playback, "Handling playback command");
+        #[cfg(feature = "streaming")]
+        if matches!(
+            &request,
+            PlayerRequest::StartPlayback(..)
+                | PlayerRequest::Resume
+                | PlayerRequest::ResumePause
+                | PlayerRequest::TransferPlayback(_, true)
+        ) {
+            self.user_requested_playback
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        let needs_device = matches!(
+            &request,
+            PlayerRequest::StartPlayback(..) | PlayerRequest::Resume | PlayerRequest::ResumePause
+        );
+        if needs_device
+            && playback
+                .as_ref()
+                .and_then(|p| p.device_id.as_ref())
+                .is_none()
+        {
+            let device_id = self.resolve_playback_device().await?;
+            playback = Some(PlaybackMetadata {
+                device_name: String::new(),
+                device_id: Some(device_id),
+                volume: None,
+                is_playing: false,
+                repeat_state: rspotify::model::RepeatState::Off,
+                shuffle_state: false,
+                mute_state: None,
+            });
+        }
         // handle requests that don't require an active playback
         match request {
             PlayerRequest::TransferPlayback(device_id, force_play) => {
@@ -384,7 +479,10 @@ impl AppClient {
                 if let Some(ref playback) = playback {
                     self.shuffle(playback.shuffle_state, device_id).await?;
                 }
-                return Ok(None);
+                if let Some(playback) = playback.as_mut() {
+                    playback.is_playing = true;
+                }
+                return Ok(playback);
             }
             _ => {}
         }
@@ -396,17 +494,13 @@ impl AppClient {
             PlayerRequest::NextTrack => self.next_track(device_id).await?,
             PlayerRequest::PreviousTrack => self.previous_track(device_id).await?,
             PlayerRequest::Resume => {
-                if !playback.is_playing {
-                    self.resume_playback(device_id, None).await?;
-                    playback.is_playing = true;
-                }
+                self.resume_playback(device_id, None).await?;
+                playback.is_playing = true;
             }
 
             PlayerRequest::Pause => {
-                if playback.is_playing {
-                    self.pause_playback(device_id).await?;
-                    playback.is_playing = false;
-                }
+                self.pause_playback(device_id).await?;
+                playback.is_playing = false;
             }
             PlayerRequest::ResumePause => {
                 if playback.is_playing {
@@ -417,7 +511,8 @@ impl AppClient {
                 playback.is_playing = !playback.is_playing;
             }
             PlayerRequest::SeekTrack(position_ms) => {
-                self.seek_track(position_ms, device_id).await?;
+                self.seek_track(position_ms.max(chrono::Duration::zero()), device_id)
+                    .await?;
             }
             PlayerRequest::Repeat => {
                 let next_repeat_state = match playback.repeat_state {
@@ -436,6 +531,7 @@ impl AppClient {
                 playback.shuffle_state = !playback.shuffle_state;
             }
             PlayerRequest::Volume(volume) => {
+                let volume = volume.min(100);
                 self.volume(volume, device_id).await?;
 
                 playback.volume = Some(u32::from(volume));
@@ -509,10 +605,7 @@ impl AppClient {
                 state.data.write().user_data.user = Some(user);
             }
             ClientRequest::Player(request) => {
-                let playback = state.player.read().buffered_playback.clone();
-                let playback = self.handle_player_request(request, playback).await?;
-                state.player.write().buffered_playback = playback;
-                self.update_playback_non_blocking(state);
+                self.handle_state_player_request(state, request).await?;
             }
             ClientRequest::GetCurrentPlayback => {
                 self.retrieve_current_playback(state, true).await?;
@@ -758,17 +851,145 @@ impl AppClient {
     /// After handling a request changing the player's playback,
     /// update the playback state **in a non-blocking manner**.
     pub fn update_playback_non_blocking(&self, state: &SharedState) {
-        // Q: Why do we need more than one request to update the playback?
-        // A: It might take a while for Spotify server to reflect the new change,
-        // making additional requests can help ensure that the playback state is always up-to-date.
+        // Coalesce event bursts into one reconciliation task, including when polling is disabled.
+        self.playback_refresh_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let Ok(permit) = self.playback_refresh.clone().try_lock_owned() else {
+            return;
+        };
         let client = self.clone();
         let state = state.clone();
         tokio::task::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let _ = client.retrieve_current_playback(&state, false).await;
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let _ = client.retrieve_current_playback(&state, false).await;
+            let permit = permit;
+            loop {
+                client
+                    .playback_refresh_requested
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                for delay in [250, 1000] {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    if let Err(err) = client.retrieve_current_playback(&state, true).await {
+                        tracing::warn!("Failed to reconcile playback: {err:#}");
+                    }
+                }
+                if !client
+                    .playback_refresh_requested
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+            }
+            drop(permit);
+            // An event may have arrived between the last check and releasing the permit.
+            if client
+                .playback_refresh_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                client.update_playback_non_blocking(&state);
+            }
         });
+    }
+
+    async fn resolve_playback_device(&self) -> Result<String> {
+        // Device discovery is a readiness check, not an unconditional startup sleep.
+        for attempt in 0..4 {
+            let devices = self
+                .available_devices()
+                .await
+                .context("discover playback device")?;
+            if let Some(id) = devices
+                .iter()
+                .find(|d| d.is_active)
+                .and_then(|d| d.id.clone())
+            {
+                return Ok(id);
+            }
+            #[cfg(feature = "streaming")]
+            if self.stream_conn.lock().is_some() {
+                let session = self.spotify.session().await;
+                if !session.is_invalid() {
+                    let id = session.device_id().to_owned();
+                    if devices.iter().any(|d| d.id.as_deref() == Some(&id)) || attempt == 3 {
+                        self.transfer_playback(&id, Some(false))
+                            .await
+                            .context("activate integrated device")?;
+                        return Ok(id);
+                    }
+                }
+            }
+            #[cfg(feature = "streaming")]
+            let local_running = self.stream_conn.lock().is_some();
+            #[cfg(not(feature = "streaming"))]
+            let local_running = false;
+            if !local_running {
+                if let Some(id) = devices.iter().find_map(|d| d.id.clone()) {
+                    self.transfer_playback(&id, Some(false)).await?;
+                    return Ok(id);
+                }
+            }
+            if attempt < 3 {
+                tracing::debug!(attempt, "Waiting for playback device registration");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        anyhow::bail!(
+            "No playback device is ready; select a device or restart the integrated client"
+        )
+    }
+
+    pub(crate) async fn handle_state_player_request(
+        &self,
+        state: &SharedState,
+        request: PlayerRequest,
+    ) -> Result<()> {
+        let _control = self.playback_control.lock().await;
+        if matches!(
+            &request,
+            PlayerRequest::ToggleMute | PlayerRequest::TransferPlayback(..)
+        ) {
+            state.player.write().pending_volume = None;
+        }
+        // Refresh an old snapshot before a toggle/device-dependent command. Explicit play and
+        // pause always send their requested action, even if Spotify's cached state disagrees.
+        let recent_command = self
+            .last_player_command
+            .lock()
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1));
+        let stale = {
+            let player = state.player.read();
+            player.buffered_playback.is_none()
+                || (!recent_command
+                    && player
+                        .playback_last_updated_time
+                        .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(1)))
+        };
+        let playback = if stale {
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.current_playback2())
+                .await
+                .context("timed out checking active playback before command")??
+                .as_ref()
+                .map(PlaybackMetadata::from_playback)
+        } else {
+            state.player.read().buffered_playback.clone()
+        };
+        let result = self.handle_player_request(request, playback).await;
+        if let Ok(playback) = &result {
+            let mut player = state.player.write();
+            if let Some(metadata) = playback {
+                let progress = player.playback_progress();
+                if let Some(current) = player.playback.as_mut() {
+                    current.progress = progress;
+                    current.is_playing = metadata.is_playing;
+                }
+                player.playback_last_updated_time = Some(std::time::Instant::now());
+            }
+            player.buffered_playback.clone_from(playback);
+            player.reconcile_pending_volume();
+            *self.last_player_command.lock() = Some(std::time::Instant::now());
+        } else {
+            state.player.write().pending_volume = None;
+        }
+        self.update_playback_non_blocking(state);
+        result.map(|_| ())
     }
 
     /// Get Spotify's available browse categories
@@ -1667,31 +1888,69 @@ impl AppClient {
         state: &SharedState,
         reset_buffered_playback: bool,
     ) -> Result<()> {
+        let Ok(poll) = self.playback_poll.try_lock() else {
+            return Ok(());
+        };
+        let Ok(control) = self.playback_control.try_lock() else {
+            return Ok(());
+        };
+        let previous_command = *self.last_player_command.lock();
+        drop(control);
+        {
+            let mut timer = self.playback_refresh_timer.lock();
+            if timer.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(750)) {
+                return Ok(());
+            }
+            *timer = Some(std::time::Instant::now());
+        }
         let new_playback = {
             // update the playback state
-            let playback = self.current_playback2().await?;
+            let mut playback = self.current_playback2().await?;
+            let Ok(_control) = self.playback_control.try_lock() else {
+                return Ok(());
+            };
             let mut player = state.player.write();
+            if previous_command != *self.last_player_command.lock() {
+                return Ok(());
+            }
 
             let prev_item = player.currently_playing();
 
-            let prev_name = match prev_item {
-                Some(rspotify::model::PlayableItem::Track(track)) => track.name.clone(),
-                Some(rspotify::model::PlayableItem::Episode(episode)) => episode.name.clone(),
-                Some(rspotify::model::PlayableItem::Unknown(_)) | None => String::new(),
-            };
+            let prev_uri = prev_item
+                .and_then(rspotify::model::PlayableItem::id)
+                .map(|id| id.uri());
 
+            let recent_command =
+                previous_command.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1));
+            if recent_command {
+                if let (Some(snapshot), Some(current)) =
+                    (playback.as_mut(), player.playback.as_ref())
+                {
+                    if snapshot.device.id == current.device.id
+                        && snapshot
+                            .item
+                            .as_ref()
+                            .and_then(rspotify::model::PlayableItem::id)
+                            .map(|id| id.uri())
+                            == prev_uri
+                    {
+                        snapshot.progress = player.playback_progress();
+                        snapshot.is_playing = player
+                            .buffered_playback
+                            .as_ref()
+                            .map_or(current.is_playing, |p| p.is_playing);
+                    }
+                }
+            }
             player.playback = playback;
             player.playback_last_updated_time = Some(std::time::Instant::now());
 
             let curr_item = player.currently_playing();
 
-            let curr_name = match curr_item {
-                Some(rspotify::model::PlayableItem::Track(track)) => track.name.clone(),
-                Some(rspotify::model::PlayableItem::Episode(episode)) => episode.name.clone(),
-                Some(rspotify::model::PlayableItem::Unknown(_)) | None => String::new(),
-            };
-
-            let new_playback = prev_name != curr_name && !curr_name.is_empty();
+            let curr_uri = curr_item
+                .and_then(rspotify::model::PlayableItem::id)
+                .map(|id| id.uri());
+            let new_playback = prev_uri != curr_uri && curr_uri.is_some();
             // check if we need to update the buffered playback
             let needs_update = match (&player.buffered_playback, &player.playback) {
                 (Some(bp), Some(p)) => bp.device_id != p.device.id || new_playback,
@@ -1699,7 +1958,7 @@ impl AppClient {
                 _ => true,
             };
 
-            if reset_buffered_playback || needs_update {
+            if (reset_buffered_playback && !recent_command) || needs_update {
                 player.buffered_playback = player.playback.as_ref().map(|p| {
                     let mut playback = PlaybackMetadata::from_playback(p);
 
@@ -1715,9 +1974,11 @@ impl AppClient {
                 });
             }
 
+            player.reconcile_pending_volume();
             new_playback
         };
 
+        drop(poll);
         if !new_playback {
             return Ok(());
         }
@@ -1738,40 +1999,6 @@ impl AppClient {
             track_or_episode.clone()
         };
 
-        // retrieve current artist for genres if not in cache
-        let curr_artist = match &curr_item {
-            rspotify::model::PlayableItem::Track(full_track) => {
-                let cached = state
-                    .data
-                    .read()
-                    .caches
-                    .genres
-                    .contains_key(&full_track.artists[0].name);
-
-                if cached {
-                    None
-                } else {
-                    match &full_track.artists[0].id {
-                        Some(id) => self.artist(id.clone()).await.ok(),
-                        None => None,
-                    }
-                }
-            }
-            rspotify::model::PlayableItem::Episode(_)
-            | rspotify::model::PlayableItem::Unknown(_) => None,
-        };
-
-        if let Some(artist) = curr_artist {
-            #[allow(deprecated)]
-            if !artist.genres.is_empty() {
-                state.data.write().caches.genres.insert(
-                    artist.name,
-                    artist.genres,
-                    *TTL_CACHE_DURATION,
-                );
-            }
-        }
-
         let url = match curr_item {
             rspotify::model::PlayableItem::Track(ref track) => {
                 crate::utils::get_track_album_image_url(track)
@@ -1789,9 +2016,17 @@ impl AppClient {
                 format!(
                     "{}-{}-cover-{}.jpg",
                     track.album.name,
-                    track.album.artists.first().unwrap().name,
+                    track
+                        .album
+                        .artists
+                        .first()
+                        .map_or("unknown", |a| a.name.as_str()),
                     // first 6 characters of the album's id
-                    &track.album.id.as_ref().unwrap().id()[..6]
+                    track
+                        .album
+                        .id
+                        .as_ref()
+                        .map_or("unknown", |id| id.id().get(..6).unwrap_or(id.id()))
                 )
             }
             #[allow(deprecated)]
@@ -1835,6 +2070,44 @@ impl AppClient {
                 .caches
                 .images
                 .insert(url.to_owned(), image, *TTL_CACHE_DURATION);
+        }
+
+        // retrieve current artist for genres if not in cache
+        let curr_artist = match &curr_item {
+            rspotify::model::PlayableItem::Track(full_track) => {
+                let artist = full_track.artists.first();
+                let cached = artist.is_none_or(|artist| {
+                    state.data.read().caches.genres.contains_key(&artist.name)
+                });
+
+                if cached {
+                    None
+                } else {
+                    match artist.and_then(|artist| artist.id.as_ref()) {
+                        Some(id) => match self.artist(id.clone()).await {
+                            Ok(artist) => Some(artist),
+                            Err(err) => {
+                                tracing::debug!("Failed to fetch playback artist: {err:#}");
+                                None
+                            }
+                        },
+                        None => None,
+                    }
+                }
+            }
+            rspotify::model::PlayableItem::Episode(_)
+            | rspotify::model::PlayableItem::Unknown(_) => None,
+        };
+
+        if let Some(artist) = curr_artist {
+            #[allow(deprecated)]
+            if !artist.genres.is_empty() {
+                state.data.write().caches.genres.insert(
+                    artist.name,
+                    artist.genres,
+                    *TTL_CACHE_DURATION,
+                );
+            }
         }
 
         // notify user about the playback's change if any

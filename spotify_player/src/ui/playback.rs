@@ -76,6 +76,9 @@ pub fn render_playback_window(
                         }
                         rspotify::model::PlayableItem::Unknown(_) => None,
                     };
+                    if url.as_deref() != Some(ui.last_cover_image_render_info.url.as_str()) {
+                        ui.last_cover_image_render_info = ImageRenderInfo::default();
+                    }
                     if let Some(url) = url {
                         let data = state.data.read();
                         if let Some(img) = data.caches.images.get(&url) {
