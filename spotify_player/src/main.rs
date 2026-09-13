@@ -198,10 +198,8 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         }
     }
 
-    // infinite loop to keep the main thread alive
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 fn main() -> Result<()> {
