@@ -313,7 +313,7 @@ pub async fn new_connection(
                             }
                             PlayerEvent::Changed { .. } => {}
                         }
-                        client.update_playback_non_blocking(&state);
+                        client.request_playback_refresh();
 
                         // Preserve hook order without blocking the playback event receiver.
                         if let Some(sender) = &hook_pub {

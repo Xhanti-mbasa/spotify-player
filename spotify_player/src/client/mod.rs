@@ -77,7 +77,6 @@ pub struct AppClient {
     // Serialize state snapshots with commands; never hold a player-state lock over I/O.
     playback_control: Arc<tokio::sync::Mutex<()>>,
     last_player_command: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
-    playback_refresh: Arc<tokio::sync::Mutex<()>>,
     playback_refresh_requested: Arc<std::sync::atomic::AtomicBool>,
     playback_poll: Arc<tokio::sync::Mutex<()>>,
     playback_refresh_timer: Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
@@ -189,7 +188,6 @@ impl AppClient {
             http: reqwest::Client::new(),
             playback_control: Arc::new(tokio::sync::Mutex::new(())),
             last_player_command: Arc::new(parking_lot::Mutex::new(None)),
-            playback_refresh: Arc::new(tokio::sync::Mutex::new(())),
             playback_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             playback_poll: Arc::new(tokio::sync::Mutex::new(())),
             playback_refresh_timer: Arc::new(parking_lot::Mutex::new(None)),
@@ -267,7 +265,7 @@ impl AppClient {
                             }
                             // upon new connection, reset the buffered playback
                             state.player.write().buffered_playback = None;
-                            client.update_playback_non_blocking(&state);
+                            client.request_playback_refresh();
                             break;
                         }
                     }
@@ -848,45 +846,14 @@ impl AppClient {
         Ok(self.device().await?)
     }
 
-    /// After handling a request changing the player's playback,
-    /// update the playback state **in a non-blocking manner**.
-    pub fn update_playback_non_blocking(&self, state: &SharedState) {
-        // Coalesce event bursts into one reconciliation task, including when polling is disabled.
+    pub(crate) fn request_playback_refresh(&self) {
         self.playback_refresh_requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let Ok(permit) = self.playback_refresh.clone().try_lock_owned() else {
-            return;
-        };
-        let client = self.clone();
-        let state = state.clone();
-        tokio::task::spawn(async move {
-            let permit = permit;
-            loop {
-                client
-                    .playback_refresh_requested
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                for delay in [250, 1000] {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    if let Err(err) = client.retrieve_current_playback(&state, true).await {
-                        tracing::warn!("Failed to reconcile playback: {err:#}");
-                    }
-                }
-                if !client
-                    .playback_refresh_requested
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    break;
-                }
-            }
-            drop(permit);
-            // An event may have arrived between the last check and releasing the permit.
-            if client
-                .playback_refresh_requested
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                client.update_playback_non_blocking(&state);
-            }
-        });
+    }
+
+    pub(super) fn take_playback_refresh_request(&self) -> bool {
+        self.playback_refresh_requested
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn resolve_playback_device(&self) -> Result<String> {
@@ -988,7 +955,7 @@ impl AppClient {
         } else {
             state.player.write().pending_volume = None;
         }
-        self.update_playback_non_blocking(state);
+        self.request_playback_refresh();
         result.map(|_| ())
     }
 

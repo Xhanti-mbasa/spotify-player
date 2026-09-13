@@ -23,6 +23,7 @@ struct PlayerEventHandlerState {
 /// Interval between background session-validity checks.
 const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_INTERVAL: Duration = Duration::from_millis(100);
+const RECONCILE_DELAYS: [Duration; 2] = [Duration::from_millis(250), Duration::from_secs(1)];
 const CONTEXT_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
 const QUEUE_REFRESH_THROTTLE: Duration = Duration::from_secs(5);
 
@@ -203,6 +204,7 @@ pub async fn run(
     events.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     sessions.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut deferred = None;
+    let mut reconciliation = None;
 
     loop {
         let request = if deferred.is_some() {
@@ -217,6 +219,21 @@ pub async fn run(
                     continue;
                 }
                 _ = events.tick() => {
+                    if client.take_playback_refresh_request() {
+                        reconciliation = Some((Instant::now(), 0));
+                    }
+                    if let Some((started, phase)) = reconciliation
+                        .filter(|(started, phase)| started.elapsed() >= RECONCILE_DELAYS[*phase])
+                    {
+                        reconciliation = (phase == 0).then_some((started, 1));
+                        let client = client.clone();
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = client.retrieve_current_playback(&state, true).await {
+                                tracing::warn!("Failed to reconcile playback: {err:#}");
+                            }
+                        });
+                    }
                     if configs.app_config.playback_refresh_duration_in_ms > 0
                         && handler_state.last_playback_refresh.elapsed() >= playback_refresh_duration
                     {

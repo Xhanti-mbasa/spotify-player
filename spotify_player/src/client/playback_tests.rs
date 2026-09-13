@@ -24,7 +24,6 @@ async fn client(server: &MockServer) -> AppClient {
         http: reqwest::Client::new(),
         playback_control: Arc::new(tokio::sync::Mutex::new(())),
         last_player_command: Arc::new(parking_lot::Mutex::new(None)),
-        playback_refresh: Arc::new(tokio::sync::Mutex::new(())),
         playback_refresh_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         playback_poll: Arc::new(tokio::sync::Mutex::new(())),
         playback_refresh_timer: Arc::new(parking_lot::Mutex::new(None)),
