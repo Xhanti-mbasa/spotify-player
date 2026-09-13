@@ -46,13 +46,14 @@ async-trait = "0.1.92"
 parking_lot = "0.12.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-backtrace = "0.3.76"
 souvlaki = { version = "0.8.3", optional = true }
-image = { version = "0.25.10", optional = true }
+image = { version = "0.25.10", optional = true, default-features = false, features = [
+	"jpeg",
+	"png",
+] }
 notify-rust = { version = "4.18.0", optional = true, default-features = false, features = [
 	"d",
 ] }
-flume = "0.12.0"
 serde_json = "1.0.151"
 regex = "1.13.1"
 daemonize = { version = "0.5.0", optional = true }

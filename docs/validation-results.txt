@@ -1,0 +1,35 @@
+Playback reliability patch validation
+=====================================
+
+Repository commit under test
+----------------------------
+346e62c Fix playback command ordering, device fallback and state synchronization
+
+Commands run
+------------
+
+cargo fmt --all -- --check
+PASS
+
+cargo check --locked --no-default-features --features rodio-backend,media-control,image,notify,fzf,daemon
+PASS
+
+cargo test --locked --no-default-features --features rodio-backend,media-control,image,notify,fzf,daemon
+PASS — 55 passed, 0 failed
+
+cargo clippy --locked --no-default-features --features rodio-backend,media-control,image,notify,fzf,daemon -- -D warnings
+PASS
+
+cargo clippy --locked --no-default-features -- -D warnings
+PASS
+
+cargo build --locked --release --no-default-features --features rodio-backend,media-control,image,notify,fzf,daemon
+PASS — finished in 5m 33s; `target/release/spotify_player --version` returned `spotify_player 0.25.1`.
+
+Environment note
+----------------
+The checks were run with the project's locked dependencies, Rust stable, and temporary native package paths for ALSA, D-Bus, and pkg-config. The target executable is produced under target/release when the release build completes.
+
+What these checks do not cover
+------------------------------
+They do not authenticate to Spotify, register a real Spotify Connect device, route audio through PipeWire/ALSA, measure phone-to-TUI propagation, or verify audible playback and visualization. Use docs/playback-reliability.md for the manual laptop and phone checklist.

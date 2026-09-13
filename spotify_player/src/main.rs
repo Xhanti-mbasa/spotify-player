@@ -67,7 +67,7 @@ fn init_logging(
     let backtrace_file = std::sync::Mutex::new(backtrace_file);
     std::panic::set_hook(Box::new(move |info| {
         let mut file = backtrace_file.lock().unwrap();
-        let backtrace = backtrace::Backtrace::new();
+        let backtrace = std::backtrace::Backtrace::force_capture();
         writeln!(&mut file, "Got a panic: {info:#?}\n").unwrap();
         writeln!(&mut file, "Stack backtrace:\n{backtrace:?}").unwrap();
     }));
@@ -78,7 +78,7 @@ fn init_logging(
 #[tokio::main]
 async fn start_app(state: &state::SharedState) -> Result<()> {
     // client channels
-    let (client_pub, client_sub) = flume::unbounded::<client::ClientRequest>();
+    let (client_pub, client_sub) = tokio::sync::mpsc::unbounded_channel();
 
     #[cfg(feature = "pulseaudio-backend")]
     {
@@ -135,35 +135,15 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         }
     });
 
-    // client event handler task
+    // One runtime owns request ordering, refreshes, and session recovery.
     tokio::task::spawn({
         let state = state.clone();
         let client = client.clone();
+        let client_pub = client_pub.clone();
         async move {
-            client::start_client_handler(&state, &client, &client_sub).await;
+            client::run(&state, &client, &client_pub, client_sub).await;
         }
     });
-
-    // background task that detects an invalidated session and reconnects,
-    // independent of any incoming client request
-    tokio::task::spawn({
-        let state = state.clone();
-        let client = client.clone();
-        async move {
-            client::start_session_watcher(state, client).await;
-        }
-    });
-
-    // player event watcher task
-    std::thread::Builder::new()
-        .name("player-event-watcher".to_string())
-        .spawn({
-            let state = state.clone();
-            let client_pub = client_pub.clone();
-            move || {
-                client::start_player_event_watcher(&state, &client_pub);
-            }
-        })?;
 
     if !state.is_daemon {
         #[cfg(feature = "image")]
@@ -218,10 +198,8 @@ async fn start_app(state: &state::SharedState) -> Result<()> {
         }
     }
 
-    // infinite loop to keep the main thread alive
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 fn main() -> Result<()> {

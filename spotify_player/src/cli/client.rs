@@ -433,7 +433,7 @@ async fn handle_playback_request(
                 .volume
                 .context("playback has no volume!")?;
             let percent = if is_offset {
-                std::cmp::max(0, (volume as i8) + percent)
+                (i64::from(volume) + i64::from(percent)).clamp(0, 100) as i8
             } else {
                 percent
             };
@@ -456,27 +456,9 @@ async fn handle_playback_request(
     };
 
     if let Some(state) = state {
-        // A non-null application's state indicates there is a running application instance.
-        // To reduce the latency of the CLI command, the player request is handled asynchronously
-        // knowing that the application will outlive the asynchronous task.
-        tokio::task::spawn({
-            let client = client.clone();
-            let state = state.clone();
-            async move {
-                match client.handle_player_request(player_request, playback).await {
-                    Ok(playback) => {
-                        // update application's states
-                        state.player.write().buffered_playback = playback;
-                        client.update_playback_non_blocking(&state);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to handle a player request for playback CLI command: {err:#}"
-                        );
-                    }
-                }
-            }
-        });
+        client
+            .handle_state_player_request(state, player_request)
+            .await?;
     } else {
         // Handles the player request synchronously
         client

@@ -280,6 +280,10 @@ impl SpotifyApiMiddleware {
         next: Next<'_>,
     ) -> reqwest_middleware::Result<Response> {
         let url = request.url();
+        if url.path().trim_end_matches('/').ends_with("/me/player") {
+            // AppClient already serializes/throttles these snapshots. Keep Retry-After handling.
+            return self.run_get_with_retries(request, extensions, next).await;
+        }
         match self.requests.register_get(Self::get_request_key(url)).await {
             GetRegistration::Shared(result) => {
                 tracing::info!(
@@ -605,5 +609,41 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+}
+
+#[cfg(test)]
+mod playback_cache_tests {
+    use super::SpotifyApiMiddleware;
+    use reqwest_middleware::ClientBuilder;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    #[tokio::test]
+    async fn playback_snapshot_is_not_replayed_from_recent_get_cache() {
+        let server = MockServer::start().await;
+        let base = format!("{}/v1", server.uri());
+        let client = ClientBuilder::new(reqwest::Client::new())
+            .with(SpotifyApiMiddleware::new(&base, 1).unwrap())
+            .build();
+        Mock::given(method("GET"))
+            .and(path("/v1/me/player"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        for _ in 0..2 {
+            assert_eq!(
+                client
+                    .get(format!("{base}/me/player"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                204
+            );
+        }
     }
 }

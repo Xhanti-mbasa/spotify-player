@@ -6,7 +6,7 @@ use super::*;
 
 pub fn handle_key_sequence_for_page(
     key_sequence: &KeySequence,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -47,7 +47,7 @@ pub fn handle_key_sequence_for_page(
 
 fn handle_action_for_library_page(
     action: Action,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
@@ -86,7 +86,7 @@ fn handle_action_for_library_page(
 
 fn handle_command_for_library_page(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
@@ -196,7 +196,7 @@ fn handle_command_for_library_page(
 
 fn handle_key_sequence_for_search_page(
     key_sequence: &KeySequence,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     state: &SharedState,
     ui: &mut UIStateGuard,
 ) -> Result<bool> {
@@ -376,7 +376,7 @@ fn handle_key_sequence_for_search_page(
 
 fn handle_command_for_context_page(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
@@ -440,7 +440,7 @@ fn handle_command_for_context_page(
 
 fn handle_action_for_browse_page(
     action: Action,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
@@ -477,7 +477,7 @@ fn handle_action_for_browse_page(
 
 fn handle_command_for_browse_page(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {

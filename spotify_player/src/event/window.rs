@@ -12,7 +12,7 @@ use rand::RngExt;
 
 pub fn handle_action_for_focused_context_page(
     action: Action,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
@@ -92,7 +92,7 @@ pub fn handle_action_for_selected_item<T: Into<ActionContext> + Clone>(
     items: &[&T],
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
 ) -> Result<bool> {
     let id = ui.current_page_mut().selected().unwrap_or_default();
     if id >= items.len() {
@@ -108,7 +108,7 @@ pub fn handle_action_for_selected_item<T: Into<ActionContext> + Clone>(
 /// assign the handling job to the window's command handler
 pub fn handle_command_for_focused_context_window(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     ui: &mut UIStateGuard,
     state: &SharedState,
 ) -> Result<bool> {
@@ -222,7 +222,7 @@ fn handle_playlist_modify_command(
     id: usize,
     playlist_id: &PlaylistId<'static>,
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     tracks: &[&Track],
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
@@ -271,7 +271,7 @@ fn handle_playlist_modify_command(
 
 fn handle_command_for_track_table_window(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     context_id: Option<ContextId>,
     tracks: &[Track],
     data: &DataReadGuard,
@@ -384,7 +384,7 @@ fn handle_command_for_track_table_window(
 
 pub fn handle_command_for_track_list_window(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     tracks: &[&Track],
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
@@ -473,7 +473,7 @@ pub fn handle_command_for_album_list_window(
     albums: &[&Album],
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
 ) -> Result<bool> {
     let id = ui.current_page_mut().selected().unwrap_or_default();
     if id >= albums.len() {
@@ -600,7 +600,7 @@ pub fn handle_command_for_show_list_window(
 
 pub fn handle_command_for_episode_list_window(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     episodes: &[&Episode],
     data: &DataReadGuard,
     ui: &mut UIStateGuard,
@@ -644,7 +644,7 @@ pub fn handle_command_for_episode_list_window(
 
 fn handle_command_for_episode_table_window(
     command: Command,
-    client_pub: &flume::Sender<ClientRequest>,
+    client_pub: &crate::client::RequestSender,
     show_id: &ShowId,
     episodes: &[&Episode],
     data: &DataReadGuard,
